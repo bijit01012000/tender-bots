@@ -1,0 +1,4 @@
+pymupdf
+rapidfuzz
+certifi
+cryptography

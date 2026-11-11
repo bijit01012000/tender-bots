@@ -1,0 +1,74 @@
+# GitHub Actions: tender alerts every 2 hours + deadline reminders 09:00 IST (ADR-013).
+# PUBLIC repo: business data comes only from secrets, bot output goes to the encrypted
+# state (state.enc), and the visible log shows nothing but exit codes.
+name: bots
+on:
+  schedule:
+    - cron: "10 */2 * * *"   # tender watcher (UTC; every 2 h)
+    - cron: "30 3 * * *"     # reminders at 09:00 IST
+  workflow_dispatch:
+    inputs:
+      job: {description: "bids | reminders | both | test", default: "both"}
+concurrency: {group: bots, cancel-in-progress: false}
+permissions: {contents: write}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WORK_DIR: state
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+      REMINDER_BOT_TOKEN: ${{ secrets.REMINDER_BOT_TOKEN }}
+      REMINDER_CHAT_IDS: ${{ secrets.REMINDER_CHAT_IDS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -q -r requirements.txt
+      - name: Load private settings and memory
+        env:
+          PROFILE_B64: ${{ secrets.AMC_PROFILE_B64 }}
+          OBLIGATIONS_B64: ${{ secrets.OBLIGATIONS_B64 }}
+        run: |
+          printf '%s' "$PROFILE_B64" | base64 -d > config/amc_profile.json
+          printf '%s' "$OBLIGATIONS_B64" | base64 -d > config/obligations.json
+          python -m apps.state_vault unpack
+          echo "LOADED=1" >> "$GITHUB_ENV"   # only then may the memory be saved back
+      - name: Tender watcher
+        if: github.event.schedule == '10 */2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'bids' || inputs.job == 'both'))
+        run: |
+          rc=0
+          { echo "== bids $(date -u +%FT%TZ)"; python -m apps.bidwatch run; } >> state/run.log 2>&1 || rc=$?
+          echo "tender watcher: exit $rc"; echo "BIDS_RC=$rc" >> "$GITHUB_ENV"
+      - name: Reminders
+        if: github.event.schedule == '30 3 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'reminders' || inputs.job == 'both'))
+        run: |
+          rc=0
+          { echo "== reminders $(date -u +%FT%TZ)"; python -m apps.reminders run; } >> state/run.log 2>&1 || rc=$?
+          echo "reminders: exit $rc"; echo "REM_RC=$rc" >> "$GITHUB_ENV"
+      - name: Test message from both bots
+        if: github.event_name == 'workflow_dispatch' && inputs.job == 'test'
+        run: |
+          python - > /tmp/test.out 2>&1 <<'PY' || true
+          from apps.bidwatch import load_env, send
+          env = load_env()
+          print(send("☁️ <b>Tender bot now runs on GitHub</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                     "🔎 Checks NALCO tenders every 2 hours\n💻 Your Mac is no longer needed", env))
+          print(send("☁️ <b>Reminder bot now runs on GitHub</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                     "⏰ Deadline reminders every day at 9:00 AM\n💻 Your Mac is no longer needed",
+                     env, prefix="REMINDER"))
+          PY
+          n=$(grep -o ": 200" /tmp/test.out | wc -l); echo "test messages delivered: $n of 2"; [ "$n" -ge 2 ]
+      - name: Save memory (encrypted)
+        if: always() && env.LOADED == '1'
+        run: |
+          force=""; [ "${BIDS_RC:-0}${REM_RC:-0}" = "00" ] || force=--force
+          python -m apps.state_vault pack $force
+          git config user.name "bots"
+          git config user.email "bots@users.noreply.github.com"
+          git add state.enc state.fp
+          git diff --cached --quiet || { git commit -q -m "state"; git push -q; }
+      - name: Fail if a bot failed
+        run: '[ "${BIDS_RC:-0}" = 0 ] && [ "${REM_RC:-0}" = 0 ]'
