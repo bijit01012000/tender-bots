@@ -178,9 +178,33 @@ def db(memory: bool = False) -> sqlite3.Connection:
         c = sqlite3.connect(WORK / "bids.db", timeout=30)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
-    if "eligibility" not in {r[1] for r in c.execute("PRAGMA table_info(bids)")}:
+    cols = {r[1] for r in c.execute("PRAGMA table_info(bids)")}
+    if "eligibility" not in cols:
         c.execute("ALTER TABLE bids ADD COLUMN eligibility TEXT")  # db from before 2026-11-11
+    if "closes_seen" not in cols:  # every closing date already announced (no flip-flop alerts)
+        c.execute("ALTER TABLE bids ADD COLUMN closes_seen TEXT DEFAULT ''")
     return c
+
+
+def _norm(s: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def same_tender(c: sqlite3.Connection, t: Tender, now: datetime) -> sqlite3.Row | None:
+    """The same tender stored under another key — e.g. NALCO added (or dropped) the GeM bid
+    number after we first saw it. Only tenders seen in the last 45 days (a yearly repeat of the
+    same work is a new tender); two different GeM numbers or OMC/MC numbers are two tenders."""
+    since = (now - timedelta(days=45)).isoformat(timespec="seconds")
+    for r in c.execute("SELECT * FROM bids WHERE last_seen >= ?", (since,)):
+        d = json.loads(r["data"])
+        if _norm(d.get("unit")) != _norm(t.unit) or (d.get("gem_bid") and t.gem_bid):
+            continue
+        if d.get("nalco_ref") and t.nalco_ref and d["nalco_ref"] != t.nalco_ref:
+            continue
+        if (t.nalco_ref and d.get("nalco_ref") == t.nalco_ref) \
+                or _norm(d.get("work")) == _norm(t.work):
+            return r
+    return None
 
 
 # ---------- messages ----------
@@ -393,6 +417,12 @@ def process(page: str, env: dict, now: datetime, dry_run: bool = False,
         stats["watched"] += 1
         sc, similar = score(t)
         row = c.execute("SELECT * FROM bids WHERE key=?", (t.key,)).fetchone()
+        if row is None and (alias := same_tender(c, t, now)) is not None:
+            if alias["key"] in seen_keys:  # listed twice on this page, once without GeM no.
+                stats["watched"] -= 1
+                continue
+            c.execute("UPDATE bids SET key=? WHERE key=?", (t.key, alias["key"]))
+            row = c.execute("SELECT * FROM bids WHERE key=?", (t.key,)).fetchone()
         data = json.dumps(asdict(t), ensure_ascii=False)
         if row is None:
             c.execute("INSERT INTO bids(key, data, score, similar_to, first_seen, last_seen,"
@@ -407,18 +437,28 @@ def process(page: str, env: dict, now: datetime, dry_run: bool = False,
                 c.execute("UPDATE bids SET notified_new=? WHERE key=?", (stamp, t.key))
                 stats["new"] += 1
         else:
-            if row["closes"] != t.closes and t.closes:
+            seen = {x for x in (row["closes_seen"] or "").split("|") if x} | (
+                {row["closes"]} if row["closes"] else set())
+            if t.closes and t.closes not in seen:  # a closing date never announced before
                 old = json.loads(row["eligibility"]) if row["eligibility"] else None
                 stats["sent"] += send(message(t, sc, similar, now, "change", old), env, dry_run)
-                c.execute("UPDATE bids SET notified_change=? WHERE key=?", (stamp, t.key))
+                # the change alert covers today; closing reminders restart for the new date
+                days = (datetime.fromisoformat(t.closes[:10]).date()
+                        - now.astimezone(IST).date()).days
+                c.execute("UPDATE bids SET notified_change=?, reminded=? WHERE key=?",
+                          (stamp, f"d{days}," if days in REMIND_DAYS else "", t.key))
                 stats["changed"] += 1
-            c.execute("UPDATE bids SET data=?, last_seen=?, closes=?, score=? WHERE key=?",
-                      (data, stamp, t.closes, sc, t.key))
+            if t.closes:
+                seen.add(t.closes)
+            c.execute("UPDATE bids SET data=?, last_seen=?, closes=?, score=?, closes_seen=?"
+                      " WHERE key=?", (data, stamp, t.closes or row["closes"], sc,
+                                       "|".join(sorted(seen)), t.key))
         r2 = c.execute("SELECT * FROM bids WHERE key=?", (t.key,)).fetchone()
         el = json.loads(r2["eligibility"]) if r2["eligibility"] else {}
-        if t.closes and r2["status"] != "skipped" and not el.get("verdict", "").startswith("❌") \
+        closes = t.closes or r2["closes"]
+        if closes and r2["status"] != "skipped" and not el.get("verdict", "").startswith("❌") \
                 and sc >= min_score:
-            days = (datetime.fromisoformat(t.closes[:10]).date() - now.astimezone(IST).date()).days
+            days = (datetime.fromisoformat(closes[:10]).date() - now.astimezone(IST).date()).days
             tag = f"d{days}"
             if row is None and days in REMIND_DAYS:  # first sighting: the new alert says it
                 c.execute("UPDATE bids SET reminded=? WHERE key=?", (tag + ",", t.key))
@@ -438,6 +478,16 @@ def process(page: str, env: dict, now: datetime, dry_run: bool = False,
     if conn is None:
         c.close()
     return stats
+
+
+def hosted_elsewhere(env: dict) -> bool:
+    """True on this Mac once the bots live on GitHub (.env BOTS_HOSTED=github): a real run here
+    would use an out-of-date memory and repeat alerts, so it must refuse."""
+    return env.get("BOTS_HOSTED") == "github" and env.get("GITHUB_ACTIONS") != "true"
+
+
+HOSTED_MSG = ("The bots run on GitHub now (BOTS_HOSTED=github in .env); a real run here would "
+              "repeat alerts. Use --dry-run, or GitHub → tender-bots → Actions → Run workflow.")
 
 
 def channels_configured(env: dict, prefix: str = "TELEGRAM") -> bool:
@@ -493,6 +543,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "setup":
         print(*setup(env), sep="\n")
         return 0
+    if a.cmd in ("run", "test") and not getattr(a, "dry_run", False) and hosted_elsewhere(env):
+        print(HOSTED_MSG, file=sys.stderr)
+        return 4
     if a.cmd == "run":
         if not a.dry_run and not channels_configured(env):
             # never mark tenders "sent" when nobody can receive them

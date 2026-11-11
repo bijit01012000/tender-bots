@@ -9,12 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       job: {description: "bids | reminders | both | test", default: "both"}
+# one run at a time; each starts from the memory the previous run saved (no repeats)
 concurrency: {group: bots, cancel-in-progress: false}
 permissions: {contents: write}
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       WORK_DIR: state
       STATE_KEY: ${{ secrets.STATE_KEY }}
@@ -24,6 +25,7 @@ jobs:
       REMINDER_CHAT_IDS: ${{ secrets.REMINDER_CHAT_IDS }}
     steps:
       - uses: actions/checkout@v4
+        with: {ref: main}   # latest memory, not the commit the run was queued at
       - uses: actions/setup-python@v5
         with: {python-version: "3.12", cache: pip}
       - run: pip install -q -r requirements.txt
@@ -37,12 +39,14 @@ jobs:
           python -m apps.state_vault unpack
           echo "LOADED=1" >> "$GITHUB_ENV"   # only then may the memory be saved back
       - name: Tender watcher
+        timeout-minutes: 12   # stuck → stop, but still save what was sent
         if: github.event.schedule == '10 */2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'bids' || inputs.job == 'both'))
         run: |
           rc=0
           { echo "== bids $(date -u +%FT%TZ)"; python -m apps.bidwatch run; } >> state/run.log 2>&1 || rc=$?
           echo "tender watcher: exit $rc"; echo "BIDS_RC=$rc" >> "$GITHUB_ENV"
       - name: Reminders
+        timeout-minutes: 5
         if: github.event.schedule == '30 3 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'reminders' || inputs.job == 'both'))
         run: |
           rc=0
@@ -69,6 +73,12 @@ jobs:
           git config user.name "bots"
           git config user.email "bots@users.noreply.github.com"
           git add state.enc state.fp
-          git diff --cached --quiet || { git commit -q -m "state"; git push -q; }
+          git diff --cached --quiet && exit 0
+          git commit -q -m "state"
+          for i in 1 2 3 4 5; do   # a lost save would mean repeats next run: retry hard
+            git push -q && exit 0
+            sleep $((i * 10)); git pull -q --rebase origin main || true
+          done
+          echo "could not save memory"; exit 1
       - name: Fail if a bot failed
         run: '[ "${BIDS_RC:-0}" = 0 ] && [ "${REM_RC:-0}" = 0 ]'

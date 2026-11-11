@@ -351,6 +351,11 @@ def main(argv: list[str] | None = None) -> int:
                      "\nYou'll get reminders here before every deadline: wages, PF, ESI, GST, "
                      "RA bills, bank guarantees and other expiries."), sep="\n")
         return 0
+    from apps.bidwatch import HOSTED_MSG, hosted_elsewhere
+
+    if not a.dry_run and hosted_elsewhere(env):
+        print(HOSTED_MSG, file=sys.stderr)
+        return 4
     prefix = bot_prefix(env)
     if not a.dry_run and not channels_configured(env, prefix):
         print("No Telegram recipient configured (python -m apps.reminders setup)",
