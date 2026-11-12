@@ -383,7 +383,7 @@ def assess(t: Tender) -> dict:
     if not url:
         return {"verdict": "⚠️ Check", "reasons": ["no tender PDF linked"], "source": None}
     try:
-        crit = parse_bid(pdf_text(fetch_pdf(url)))
+        crit = parse_bid(pdf_text(fetch_pdf(url), pages=40))  # NIT rules sit deep inside
     except Exception as e:  # noqa: BLE001 - a bad PDF must not stop the alert
         return {"verdict": "⚠️ Check", "reasons": [f"could not read PDF ({type(e).__name__})"],
                 "source": url}

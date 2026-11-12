@@ -36,6 +36,8 @@ class Criteria:
     office: str | None = None
     similar_rule: list[tuple[int, int]] = field(default_factory=list)  # (orders, percent)
     read_ok: bool = False
+    kind: str = ""          # gem_bid | nit | notice | forms | unknown
+    gem_ref: str | None = None
 
 
 def _num(s: str) -> float:
@@ -49,8 +51,19 @@ def _yes(s: str | None) -> bool | None:
 def parse_bid(text: str) -> Criteria:
     """Criteria from a GeM bid document's text (Hindi labels between English label and value
     are tolerated by searching a short window after each English label)."""
+    full = text[:150000]
     t = text[:20000]
     c = Criteria()
+    if m := re.search(r"GEM/20\d\d/B/\d{6,8}", full):
+        c.gem_ref = m[0]
+    if re.search(r"Bid Number", t) and re.search(r"EMD|Bid Details|Item Category", t):
+        c.kind = "gem_bid"
+    elif len(full) < 1500:
+        c.kind = "notice"
+    elif re.search(r"NECESSARY FORMS|CHECK ?LIST", full[:400], re.IGNORECASE):
+        c.kind = "forms"
+    else:
+        c.kind = "nit"
     if m := re.search(r"Minimum Average Annual Turnover.{0,220}?(\d[\d,.]*)\s*(Lakh|Crore|Cr)",
                       t, S):
         c.turnover_inr = int(_num(m[1]) * (LAKH if m[2].lower().startswith("l") else CRORE))
@@ -58,9 +71,12 @@ def parse_bid(text: str) -> Criteria:
         c.experience_years = int(m[1])
     if m := re.search(r"Past Experience of Similar Services.{0,160}?\b(Yes|No)\b", t, S):
         c.similar_required = _yes(m[1])
-    if m := re.search(r"MSE Exemption for Years of Experience.{0,140}?\b(Yes|No)\b", t, S):
+    # older GeM layout says "Exemption", newer says "Relaxation"
+    if m := re.search(r"MSE\s+(?:Exemption|Relaxation)\s+for\s+Years\s+of\s+(?:Past\s+)?Experience"
+                      r".{0,140}?\b(Yes|No)\b", t, S):
         c.mse_exemption = _yes(m[1])
-    if m := re.search(r"Startup Exemption for Years of Experience.{0,140}?\b(Yes|No)\b", t, S):
+    if m := re.search(r"Startup\s+(?:Exemption|Relaxation)\s+for\s+Years\s+of\s+(?:Past\s+)?Experience"
+                      r".{0,140}?\b(Yes|No)\b", t, S):
         c.startup_exemption = _yes(m[1])
     # values may be on the next line; >= 4 digits so stray digits in garbled Hindi don't match
     if m := re.search(r"Estimated Bid Value(?! indicated).{0,100}?(?<![\d.])(\d[\d,]{3,}(?:\.\d+)?)",
@@ -77,8 +93,15 @@ def parse_bid(text: str) -> Criteria:
     for n, pct in re.findall(r"(One|Two|Three)\s+similar\s+completed\s+services?\s+costing\s+not"
                              r"\s+less\s+than\s+the\s+amount\s+equal\s+to\s+(\d{2})\s*%", t, re.IGNORECASE):
         c.similar_rule.append(({"one": 1, "two": 2, "three": 3}[n.lower()], int(pct)))
-    c.read_ok = any(v is not None for v in (c.turnover_inr, c.experience_years,
-                                             c.estimated_inr, c.mse_exemption))
+    if c.kind == "nit" and c.turnover_inr is None and (m := re.search(
+            r"average annual (?:financial )?turnover.{0,260}?(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)"
+            r"\s*(lakh|lac|crore|cr)?", full, S | re.IGNORECASE)):
+        unit = (m[2] or "").lower()
+        mult = LAKH if unit.startswith(("lakh", "lac")) else CRORE if unit.startswith("cr") else 1
+        c.turnover_inr = int(_num(m[1]) * mult)
+    c.read_ok = c.kind == "gem_bid" or any(
+        v is not None for v in (c.turnover_inr, c.experience_years, c.estimated_inr,
+                                c.mse_exemption))
     return c
 
 
@@ -93,7 +116,13 @@ def _l(x: int) -> str:
 def verdict(c: Criteria, p: dict | None) -> tuple[str, list[str]]:
     """('✅ Likely eligible' | '⚠️ Check' | '❌ Probably not eligible', reasons)."""
     if not c.read_ok:
-        return "⚠️ Check", ["eligibility not readable from the bid PDF — open it"]
+        where = f" (GeM bid {c.gem_ref})" if c.gem_ref else ""
+        why = {"notice": f"only a short notice — full terms on GeM{where}",
+               "forms": "this PDF is the forms/checklist — qualifying rules are in another "
+                        "tender document",
+               "nit": "qualifying rules not in this PDF — see the tender documents on the portal"
+               }.get(c.kind, "eligibility not readable from the bid PDF — open it")
+        return "⚠️ Check", [why]
     if not p:
         return "⚠️ Check", ["AMC profile missing (config/amc_profile.json)"]
     fails, checks, oks = [], [], []
@@ -145,8 +174,14 @@ def verdict(c: Criteria, p: dict | None) -> tuple[str, list[str]]:
         waivable = [f for f in fails if f.startswith(("turnover", "needs"))]
         fails = [f for f in fails if f not in waivable]
         material += [f"{f} (may be exempt as MSE)" for f in waivable]
+    if c.kind == "gem_bid" and not (c.turnover_inr or c.experience_years or
+                                    c.similar_required):
+        oks.append("no turnover / experience rule in the GeM bid")
+        checks.append("read the ATC / extra documents for any other conditions")
     if c.emd_inr:
-        checks.append(f"EMD {_l(c.emd_inr)}")
+        exempt = p.get("mse", {}).get("value")
+        checks.append(f"EMD {_l(c.emd_inr)}" + (" — MSE (Udyam) can claim exemption"
+                                                 if exempt else ""))
     if not p.get("confirmed", False):
         checks.append("AMC profile not yet confirmed")
     if fails:
