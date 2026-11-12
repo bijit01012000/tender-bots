@@ -19,14 +19,14 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 OBLIGATIONS = REPO / "config" / "obligations.json"
 STATE_DB = Path(os.environ.get("WORK_DIR", REPO / "work")) / "reminders.db"
 ICON = {"wages": "💰", "gstr1": "🧾", "gstr3b": "🏛️", "pf": "👷", "esi": "🏥", "rabills": "📑",
-        "bg": "🏦", "end": "📆", "dsc": "🔐", "manual": "📌"}
+        "bg": "🏦", "end": "📆", "close": "🏁", "dsc": "🔐", "manual": "📌"}
 RULE = "━━━━━━━━━━━━━━━━━━━━"
 MONTHLY_LEADS = (3, 0)        # days before a monthly deadline
 ONE_OFF_LEADS = (60, 30, 7)   # days before an expiry
@@ -115,6 +115,16 @@ def from_catalog(db: Path, today: date) -> list[dict]:
                         "title_en": f"Contract {w['ref']} ends — plan extension or new bid",
                         "title_or": f"{w['ref']} କଣ୍ଟ୍ରାକ୍ଟ ଶେଷ ହେଉଛି — ମିଆଦ ବୃଦ୍ଧି ବା ନୂଆ ଟେଣ୍ଡର ଦେଖନ୍ତୁ",
                         "evidence": f"folder name '{names[:80]}'", "label": "INFERRED"})
+            # NALCO rule (GCC cl. 38.1.2; letter on OMC-5577, 02-01-2026): workers' full & final
+            # payment and the final bill within 3 months of the end, else NALCO pays them + 25 %
+            out.append({"id": f"close:{w['ref']}",
+                        "date": (end + timedelta(days=90)).isoformat(),
+                        "title_en": f"{w['ref']}: last day for workers' full & final payment and "
+                                    "the final bill (3 months after contract end)",
+                        "title_or": f"{w['ref']}: ଶ୍ରମିକଙ୍କ ପୂରା ଓ ଶେଷ ଟଙ୍କା ଓ ଫାଇନାଲ୍ ବିଲ୍‌ର "
+                                    "ଶେଷ ଦିନ (କାମ ଶେଷର ୩ ମାସ ପରେ)",
+                        "evidence": "NALCO letter 02-01-2026 (GCC cl. 38.1.2); end date from "
+                                    f"folder name '{names[:60]}'", "label": "INFERRED"})
     # second pass: any document carrying a BG number and an expiry date, wherever it lies
     ref_rx = re.compile(r"\b(OMC|MC)\s*-?\s*(\d{4})\b|(ASH MECH[^/]*)", re.IGNORECASE)
     for fid, bg, exp in c.execute(
@@ -146,6 +156,12 @@ def from_catalog(db: Path, today: date) -> list[dict]:
                 "evidence": "folder 'P.F (SMELTER)/DSC REG/19.11.25 TO 10.11.27'",
                 "label": "INFERRED"})
     return out
+
+
+def kind(item_id: str) -> str:
+    """'bg:…' → 'bg'; hand-added 'manual:end:OMC-5916' → 'end' (same icon/source as found ones)."""
+    parts = item_id.split(":")
+    return parts[1] if parts[0] == "manual" and len(parts) > 2 else parts[0]
 
 
 def merge(old: dict, monthly: list[dict], one_off: list[dict]) -> dict:
@@ -210,7 +226,7 @@ def message(it: dict, left: int) -> str:
     def e(s: str) -> str:
         return html.escape(s, quote=False)  # keep apostrophes readable
 
-    icon = ICON.get(it["id"].split(":")[0], "📌")
+    icon = ICON.get(kind(it["id"]), "📌")
     dot = "🔴" if left <= 2 else ("🟠" if left <= 7 else "🟢")
     tail = "due today" if left == 0 else ("1 day left" if left == 1 else f"{left} days left")
     lines = ["⏰ <b>REMINDER</b>", RULE, f"{icon} <b>{e(it['title_en'])}</b>",
@@ -244,12 +260,13 @@ def bot_prefix(env: dict) -> str:
 SOURCE_OR = {  # how we know, in simple Odia, for the father's check sheet
     "wages": "ନାଲକୋ GM (ମେକାନିକାଲ) ଙ୍କ ଇମେଲ, 07-08-2026",
     "gstr1": "GST ପୋର୍ଟାଲର ଇମେଲ (ଅକ୍ଟୋବର ଓ ନଭେମ୍ବର 2026)",
-    "pf": "ପୁରୁଣା ଫାଇଲ: PF ECR ପ୍ରତି ମାସ 13–14 ତାରିଖରେ",
-    "esi": "ସାଧାରଣ ESIC ନିୟମ — ଆମ ଫାଇଲରେ ମିଳିନାହିଁ",
+    "pf": "PF ରସିଦ: ମେ–ସେପ୍ଟେମ୍ବର 2026 ପ୍ରତି ମାସ 14–15 ତାରିଖରେ ଜମା",
+    "esi": "ESIC ଚାଲାଣ: ଅଗଷ୍ଟ 2026 ର ଜମା 15-09-2026",
     "gstr3b": "GST ପୋର୍ଟାଲ ଇମେଲ: ଅଧିକାଂଶ ମାସ 20 ତାରିଖ (ଦୁଇ ଥର ବିଳମ୍ବ)",
     "rabills": "ପୁରୁଣା ଫାଇଲ: ପ୍ରତି ମାସ RA ବିଲ୍",
     "bg": "ବ୍ୟାଙ୍କ ଗ୍ୟାରେଣ୍ଟି କାଗଜ (ସ୍କାନ — PDF ଦେଖି ମିଳାନ୍ତୁ)",
     "end": "କଣ୍ଟ୍ରାକ୍ଟ ଫୋଲ୍ଡରର ନାମ",
+    "close": "NALCO ଚିଠି 02-01-2026: କାମ ଶେଷର ୩ ମାସ ଭିତରେ, ନହେଲେ ୨୫% ଅଧିକ କଟେ",
     "dsc": "DSC ଫୋଲ୍ଡରର ନାମ",
 }
 
@@ -266,7 +283,7 @@ def check_sheet(obl: dict, today: date) -> str:
     rows_o = "".join(
         f"<tr><td class='c'>{date.fromisoformat(o['date']).strftime('%d-%m-%Y')}</td>"
         f"<td>{e(o['title_or'])}<div class='en'>{e(o['title_en'])}</div></td>"
-        f"<td class='src'>{e(SOURCE_OR.get(o['id'].split(':')[0], ''))}</td>"
+        f"<td class='src'>{e(o.get('source_or') or SOURCE_OR.get(kind(o['id']), ''))}</td>"
         f"<td class='bx'>{'✔ ଯାଞ୍ଚ ହୋଇଛି' if o.get('verified') else box}</td><td></td></tr>"
         for o in obl.get("one_off", []) if o["date"] >= today.isoformat())
     return f"""<!DOCTYPE html><html lang="or"><head><meta charset="utf-8">
