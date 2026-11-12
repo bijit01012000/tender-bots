@@ -158,6 +158,13 @@ def from_catalog(db: Path, today: date) -> list[dict]:
     return out
 
 
+def in_hours(window: str, now: datetime) -> bool:
+    """'8-21' → True from 08:00 to 21:59. Reminders are checked every hour; this keeps them
+    out of the night, and a dropped GitHub run is simply caught by the next one."""
+    lo, hi = (int(x) for x in window.split("-"))
+    return lo <= now.hour <= hi
+
+
 def kind(item_id: str) -> str:
     """'bg:…' → 'bg'; hand-added 'manual:end:OMC-5916' → 'end' (same icon/source as found ones)."""
     parts = item_id.split(":")
@@ -333,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
     u.add_argument("--days", type=int, default=60)
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--hours", default="",
+                   help="send only between these IST hours, e.g. 8-21 (GitHub runs it hourly)")
     sub.add_parser("sheet", help="printable check sheet for father → kb/calendar/")
     sub.add_parser("setup", help="register chats that pressed Start on the reminder bot")
     a = ap.parse_args(argv)
@@ -374,6 +383,9 @@ def main(argv: list[str] | None = None) -> int:
     if not a.dry_run and hosted_elsewhere(env):
         print(HOSTED_MSG, file=sys.stderr)
         return 4
+    if a.hours and not in_hours(a.hours, datetime.now(IST)):
+        print(f"outside sending hours {a.hours} IST — nothing sent")
+        return 0
     prefix = bot_prefix(env)
     if not a.dry_run and not channels_configured(env, prefix):
         print("No Telegram recipient configured (python -m apps.reminders setup)",
