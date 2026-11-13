@@ -228,6 +228,30 @@ def to_send(obl: dict, today: date, sent: set[str]) -> list[tuple[dict, int, str
     return out
 
 
+def digest(obl: dict, today: date, days: int = 7) -> str:
+    """Daily status card: what is due in the next week, else the next deadline."""
+    items = sorted((i for i in due_items(obl, today) if not i.get("disabled")),
+                   key=lambda i: i["due"])
+    week = [i for i in items if (i["due"] - today).days <= days]
+    lines = [f"☀️ <b>TODAY'S STATUS</b> · {today.strftime('%a, %d %b %Y')}", RULE]
+    if week:
+        lines.append(f"📋 <b>Due in the next {days} days</b>")
+        for i in week:
+            left = (i["due"] - today).days
+            dot = "🔴" if left <= 2 else ("🟠" if left <= 7 else "🟢")
+            when = "today" if left == 0 else f"{left} day{'s' if left != 1 else ''}"
+            lines.append(f"{dot} {ICON.get(kind(i['id']), '📌')} {html.escape(i['title_en'])}"
+                         f" — <b>{i['due'].strftime('%d %b')}</b> ({when})")
+    else:
+        lines.append("✅ <b>Nothing due this week</b>")
+        if items:
+            n = items[0]
+            lines.append(f"Next: {ICON.get(kind(n['id']), '📌')} {html.escape(n['title_en'])}"
+                         f" — <b>{n['due'].strftime('%d %b')}</b>")
+    lines += ["", "<i>ଆଜିର ସ୍ଥିତି — ଆଗାମୀ ୭ ଦିନର ଶେଷ ତାରିଖ</i>"]
+    return "\n".join(lines)
+
+
 def message(it: dict, left: int) -> str:
     """Card layout: icon + English title, Odia title, due date, urgency, verification note."""
     def e(s: str) -> str:
@@ -398,6 +422,14 @@ def main(argv: list[str] | None = None) -> int:
         print(key, res)
         if not a.dry_run and any(": 200" in x for x in res):
             c.execute("INSERT OR IGNORE INTO sent VALUES (?, ?)", (key, today.isoformat()))
+            c.commit()
+    # once a day: a short status, so a silent day still shows the bot is alive
+    dkey = f"digest|{today.isoformat()}"
+    if a.hours and dkey not in sent and datetime.now(IST).hour >= 9:
+        res = send(digest(obl, today), env, dry_run=a.dry_run, prefix=prefix)
+        print(dkey, res)
+        if not a.dry_run and any(": 200" in x for x in res):
+            c.execute("INSERT OR IGNORE INTO sent VALUES (?, ?)", (dkey, today.isoformat()))
             c.commit()
     return 0
 

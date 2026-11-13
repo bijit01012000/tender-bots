@@ -150,8 +150,9 @@ def verdict(c: Criteria, p: dict | None) -> tuple[str, list[str]]:
         rule = c.similar_rule or [(3, 40), (2, 50), (1, 80)]
 
         def meets(key: str) -> str | None:
-            vals = sorted((o.get(key) or o["value_inr"] for o in p.get("completed_orders", [])),
-                          reverse=True)
+            # a NALCO completion certificate's value beats cash-based estimates
+            vals = sorted((max(o.get("certified_value_inr") or 0, o.get(key) or o["value_inr"])
+                           for o in p.get("completed_orders", [])), reverse=True)
             return next((f"{n}×≥{pct}%" for n, pct in rule
                          if len(vals) >= n and vals[n - 1] >= c.estimated_inr * pct / 100), None)
 
