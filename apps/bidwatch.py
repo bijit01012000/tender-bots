@@ -534,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true", help="print messages instead of sending")
     r.add_argument("--no-pdf", action="store_true", help="skip the eligibility check")
+    r.add_argument("--hours", default="",
+                   help="only check and alert between these IST hours, e.g. 8-23 (quiet at night)")
     sub.add_parser("list")
     sub.add_parser("test")
     sub.add_parser("setup", help="register chats that pressed Start; send a test")
@@ -552,6 +554,11 @@ def main(argv: list[str] | None = None) -> int:
             print("No recipient configured: run `python -m apps.bidwatch setup` after pressing "
                   "Start on the bot.", file=sys.stderr)
             return 3
+        if a.hours:
+            from apps.reminders import in_hours
+            if not in_hours(a.hours, now):
+                print(f"quiet hours (alerts only {a.hours} IST) — will catch up after")
+                return 0
         page = fetch()
         WORK.joinpath("bidwatch").mkdir(parents=True, exist_ok=True)
         WORK.joinpath("bidwatch", "last_page.html").write_text(page, encoding="utf-8")

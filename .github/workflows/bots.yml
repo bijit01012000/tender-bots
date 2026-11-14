@@ -44,7 +44,7 @@ jobs:
         if: github.event_name == 'schedule' || inputs.job == 'bids' || inputs.job == 'both'
         run: |
           rc=0
-          { echo "== bids $(date -u +%FT%TZ)"; python -m apps.bidwatch run; } >> state/run.log 2>&1 || rc=$?
+          { echo "== bids $(date -u +%FT%TZ)"; python -m apps.bidwatch run --hours 8-23; } >> state/run.log 2>&1 || rc=$?
           echo "tender watcher: exit $rc"; echo "BIDS_RC=$rc" >> "$GITHUB_ENV"
       - name: Reminders
         timeout-minutes: 5
